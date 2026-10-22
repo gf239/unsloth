@@ -154,6 +154,10 @@ from ..kernels.fused_add_rms_layernorm import (
     fast_add_rms_layernorm_inference,
     fast_add_rms_layernorm_inference_ok,
 )
+from ..kernels.fused_decode_rope_kv import (
+    fast_decode_rope_kv,
+    fast_decode_rope_kv_ok,
+)
 from ..kernels import fast_lora as _fast_lora
 from ..kernels.bnb_override import install_bnb_nf4_override as _install_bnb_nf4_override
 from ..tokenizer_utils import *
@@ -763,27 +767,32 @@ def LlamaAttention_fast_forward_inference(
     self.rotary_emb.extend_rope_embedding(Vn, rotary_seq_len + 1)  # +1 slack
     cos, sin = self.rotary_emb.get_cached(rotary_seq_len, Qn.device.index or 0)
 
-    cos = cos[position_ids].unsqueeze(1).to(device = Qn.device, dtype = Qn.dtype)
-    sin = sin[position_ids].unsqueeze(1).to(device = Qn.device, dtype = Qn.dtype)
+    paged_K_slice = self.paged_attention_K[seq_len]
+    paged_V_slice = self.paged_attention_V[seq_len]
+    if fast_decode_rope_kv_ok(Qn, Kn, Vn, cos, sin, position_ids, paged_K_slice, paged_V_slice):
+        fast_decode_rope_kv(Qn, Kn, Vn, cos, sin, position_ids, paged_K_slice, paged_V_slice)
+    else:
+        cos = cos[position_ids].unsqueeze(1).to(device = Qn.device, dtype = Qn.dtype)
+        sin = sin[position_ids].unsqueeze(1).to(device = Qn.device, dtype = Qn.dtype)
 
-    h = self.half_head_dim
+        h = self.half_head_dim
 
-    RH_Q = self.RH_Q
-    RH_Q[:, :, :, :h] = Qn[:, :, :, h:]
-    RH_Q[:, :, :, h:] = Qn[:, :, :, :h]
-    RH_Q[:, :, :, :h].neg_()
-    Qn *= cos
-    Qn.addcmul_(RH_Q, sin)
+        RH_Q = self.RH_Q
+        RH_Q[:, :, :, :h] = Qn[:, :, :, h:]
+        RH_Q[:, :, :, h:] = Qn[:, :, :, :h]
+        RH_Q[:, :, :, :h].neg_()
+        Qn *= cos
+        Qn.addcmul_(RH_Q, sin)
 
-    RH_K = RH_Q[:, :n_kv_heads, :, :]
-    RH_K[:, :, :, :h] = Kn[:, :, :, h:]
-    RH_K[:, :, :, h:] = Kn[:, :, :, :h]
-    RH_K[:, :, :, :h].neg_()
-    Kn *= cos
-    Kn.addcmul_(RH_K, sin)
+        RH_K = RH_Q[:, :n_kv_heads, :, :]
+        RH_K[:, :, :, :h] = Kn[:, :, :, h:]
+        RH_K[:, :, :, h:] = Kn[:, :, :, :h]
+        RH_K[:, :, :, :h].neg_()
+        Kn *= cos
+        Kn.addcmul_(RH_K, sin)
 
-    self.paged_attention_K[seq_len] = Kn.permute(2, 0, 1, 3)
-    self.paged_attention_V[seq_len] = Vn.permute(2, 0, 1, 3)
+        self.paged_attention_K[seq_len] = Kn.permute(2, 0, 1, 3)
+        self.paged_attention_V[seq_len] = Vn.permute(2, 0, 1, 3)
     Kn = self.paged_attention_K[:kv_seq_len].permute(1, 2, 0, 3)
     Vn = self.paged_attention_V[:kv_seq_len].permute(1, 2, 0, 3)
 
@@ -4321,8 +4330,7 @@ class FastLlamaModel:
                     )
             except Exception as _exc:
                 logger.warning(
-                    f"Unsloth: could not check the dispatch hooks "
-                    f"({type(_exc).__name__}: {_exc})."
+                    f"Unsloth: could not check the dispatch hooks ({type(_exc).__name__}: {_exc})."
                 )
         _install_bnb_nf4_override()
         return model, tokenizer

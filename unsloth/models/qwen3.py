@@ -254,12 +254,6 @@ def Qwen3Attention_fast_forward_inference(
     Kn = Kn.view(bsz, 1, n_kv_heads, head_dim)
     Vn = Vn.view(bsz, 1, n_kv_heads, head_dim).transpose(1, 2)
 
-    Qn = fast_rms_layernorm_inference(self.q_norm, Qn)
-    Kn = fast_rms_layernorm_inference(self.k_norm, Kn)
-
-    Qn = Qn.transpose(1, 2)
-    Kn = Kn.transpose(1, 2)
-
     # Must be done 2 steps before hitting full on a short KV cache, or it errors.
     # rotary_seq_len (from the model-level decode loop, no extra sync) covers explicit positions
     # past the KV length, since the cache only builds the rows asked for.
@@ -270,26 +264,62 @@ def Qwen3Attention_fast_forward_inference(
     # Transformers 5.x: position_ids may be [batch, full_seq_len]; slice to last.
     if position_ids.dim() >= 2 and position_ids.shape[-1] > 1:
         position_ids = position_ids[:, -1:]
-    cos = cos[position_ids].unsqueeze(1)
-    sin = sin[position_ids].unsqueeze(1)
-    h = self.half_head_dim
 
-    RH_Q = self.RH_Q
-    RH_Q[:, :, :, :h] = Qn[:, :, :, h:]
-    RH_Q[:, :, :, h:] = Qn[:, :, :, :h]
-    RH_Q[:, :, :, :h].neg_()
-    Qn *= cos
-    Qn.addcmul_(RH_Q, sin)
+    paged_K_slice = self.paged_attention_K[seq_len]
+    paged_V_slice = self.paged_attention_V[seq_len]
+    Qn_t = Qn.transpose(1, 2)
+    Kn_t = Kn.transpose(1, 2)
+    if fast_decode_rope_kv_ok(
+        Qn_t,
+        Kn_t,
+        Vn,
+        cos,
+        sin,
+        position_ids,
+        paged_K_slice,
+        paged_V_slice,
+        self.q_norm,
+        self.k_norm,
+    ):
+        Qn = fast_decode_rope_kv(
+            Qn_t,
+            Kn_t,
+            Vn,
+            cos,
+            sin,
+            position_ids,
+            paged_K_slice,
+            paged_V_slice,
+            self.q_norm,
+            self.k_norm,
+        )
+    else:
+        Qn = fast_rms_layernorm_inference(self.q_norm, Qn)
+        Kn = fast_rms_layernorm_inference(self.k_norm, Kn)
 
-    RH_K = RH_Q[:, :n_kv_heads, :, :]
-    RH_K[:, :, :, :h] = Kn[:, :, :, h:]
-    RH_K[:, :, :, h:] = Kn[:, :, :, :h]
-    RH_K[:, :, :, :h].neg_()
-    Kn *= cos
-    Kn.addcmul_(RH_K, sin)
+        Qn = Qn.transpose(1, 2)
+        Kn = Kn.transpose(1, 2)
 
-    self.paged_attention_K[seq_len] = Kn.permute(2, 0, 1, 3)
-    self.paged_attention_V[seq_len] = Vn.permute(2, 0, 1, 3)
+        cos = cos[position_ids].unsqueeze(1)
+        sin = sin[position_ids].unsqueeze(1)
+        h = self.half_head_dim
+
+        RH_Q = self.RH_Q
+        RH_Q[:, :, :, :h] = Qn[:, :, :, h:]
+        RH_Q[:, :, :, h:] = Qn[:, :, :, :h]
+        RH_Q[:, :, :, :h].neg_()
+        Qn *= cos
+        Qn.addcmul_(RH_Q, sin)
+
+        RH_K = RH_Q[:, :n_kv_heads, :, :]
+        RH_K[:, :, :, :h] = Kn[:, :, :, h:]
+        RH_K[:, :, :, h:] = Kn[:, :, :, :h]
+        RH_K[:, :, :, :h].neg_()
+        Kn *= cos
+        Kn.addcmul_(RH_K, sin)
+
+        self.paged_attention_K[seq_len] = Kn.permute(2, 0, 1, 3)
+        self.paged_attention_V[seq_len] = Vn.permute(2, 0, 1, 3)
     Kn = self.paged_attention_K[:kv_seq_len].permute(1, 2, 0, 3)
     Vn = self.paged_attention_V[:kv_seq_len].permute(1, 2, 0, 3)
 
